@@ -1,25 +1,11 @@
 #include <cugraph/algorithms.hpp>
 #include <cugraph/detail/shuffle_wrappers.hpp>
-#include <cugraph/edge_property.hpp>
-#include <cugraph/graph.hpp>
-#include <cugraph/graph_functions.hpp>
 
-#include <cugraph/partition_manager.hpp>
+#include <cugraph/graph_functions.hpp>
 
 #include <raft/comms/mpi_comms.hpp>
 #include <raft/core/comms.hpp>
 #include <raft/core/handle.hpp>
-
-#include <rmm/device_scalar.hpp>
-#include <rmm/device_uvector.hpp>
-
-#include <rmm/exec_policy.hpp>
-#include <rmm/mr/device/binning_memory_resource.hpp>
-#include <rmm/mr/device/cuda_memory_resource.hpp>
-#include <rmm/mr/device/managed_memory_resource.hpp>
-#include <rmm/mr/device/owning_wrapper.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
-#include <rmm/mr/device/pool_memory_resource.hpp>
 
 #include "iostream"
 using namespace std;
@@ -58,10 +44,6 @@ void run_graph_algos(raft::handle_t const& handle)
 
   constexpr bool is_weighted = true;
 
-  size_t num_edges    = 16;
-  size_t num_vertices = 6;
-  size_t max_level    = 10;
-
   using vertex_t = int32_t;
   using edge_t   = int32_t;
   using weight_t = float;
@@ -69,10 +51,20 @@ void run_graph_algos(raft::handle_t const& handle)
   weight_t threshold  = 1e-7;
   weight_t resolution = 1.0;
 
+  size_t num_edges = 16;
+  size_t max_level = 10;
+
   std::vector<vertex_t> input_src_v = {0, 1, 1, 2, 2, 2, 3, 4, 1, 3, 4, 0, 1, 3, 5, 5};
   std::vector<vertex_t> input_dst_v = {1, 3, 4, 0, 1, 3, 5, 5, 0, 1, 1, 2, 2, 2, 3, 4};
   std::vector<weight_t> input_wgt_v = {
     0.1f, 2.1f, 1.1f, 5.1f, 3.1f, 4.1f, 7.2f, 3.2f, 0.1f, 2.1f, 1.1f, 5.1f, 3.1f, 4.1f, 7.2f, 3.2f};
+
+  // size_t num_edges = 6;
+  // size_t max_level = 10;
+
+  // std::vector<vertex_t> input_src_v = {3, 5, 7, 8, 8, 8};
+  // std::vector<vertex_t> input_dst_v = {8, 8, 8, 3, 5, 7};
+  // std::vector<weight_t> input_wgt_v = {38, 58, 78, 38, 58, 78};
 
   std::cout << input_src_v.size() << " " << input_dst_v.size() << " " << input_wgt_v.size()
             << std::endl;
@@ -105,10 +97,10 @@ void run_graph_algos(raft::handle_t const& handle)
   raft::update_device(d_src_v.data(), input_src_v.data() + start, work_size, handle.get_stream());
   raft::update_device(d_dst_v.data(), input_dst_v.data() + start, work_size, handle.get_stream());
 
-  for (size_t i = 0; i < comm_size; i++) {
+  for (size_t r = 0; r < comm_size; r++) {
     RAFT_CUDA_TRY(cudaDeviceSynchronize());
-    if (comm_rank == i) {
-      std::cout << "rank " << i << " : " << std::endl;
+    if (comm_rank == r) {
+      std::cout << "rank " << r << " : " << std::endl;
       raft::print_device_vector("d_src_v:", d_src_v.data(), d_src_v.size(), std::cout);
       raft::print_device_vector("d_dst_v:", d_dst_v.data(), d_dst_v.size(), std::cout);
       if (d_wgt_v)
@@ -116,7 +108,7 @@ void run_graph_algos(raft::handle_t const& handle)
     }
   }
 
-  //
+  // Shuffle edges
 
   if (multi_gpu) {
     std::tie(store_transposed ? d_dst_v : d_src_v,
@@ -136,6 +128,19 @@ void run_graph_algos(raft::handle_t const& handle)
                  std::nullopt);
   }
 
+  // Shuffled edges
+  for (size_t r = 0; r < comm_size; r++) {
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    if (comm_rank == r) {
+      std::cout << "rank " << r << " : " << std::endl;
+      raft::print_device_vector("d_src_v:", d_src_v.data(), d_src_v.size(), std::cout);
+      raft::print_device_vector("d_dst_v:", d_dst_v.data(), d_dst_v.size(), std::cout);
+      if (d_wgt_v)
+        raft::print_device_vector("d_wgt_v:", d_wgt_v->data(), d_wgt_v->size(), std::cout);
+    }
+  }
+
+  // Create graph
   cugraph::graph_t<vertex_t, edge_t, store_transposed, multi_gpu> graph(handle);
 
   std::optional<cugraph::edge_property_t<decltype(graph.view()), weight_t>> edge_weights{
@@ -161,19 +166,97 @@ void run_graph_algos(raft::handle_t const& handle)
                                                    renumber,
                                                    true);
 
-  ///
+  // Renumber map
+  for (size_t r = 0; r < comm_size; r++) {
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    if (comm_rank == r) {
+      if (renumber_map) {
+        std::cout << "rank " << r << " : " << std::endl;
+        raft::print_device_vector(
+          "(*renumber_map):", (*renumber_map).data(), (*renumber_map).size(), std::cout);
+      }
+    }
+  }
+
   auto graph_view       = graph.view();
   auto edge_weight_view = edge_weights ? std::make_optional((*edge_weights).view()) : std::nullopt;
 
-  rmm::device_uvector<vertex_t> d_sg_cluster_v(graph.number_of_vertices(), handle.get_stream());
+  // Look into edge partitions
+  for (size_t r = 0; r < comm_size; r++) {
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    if (comm_rank == r) {
+      for (size_t ep_idx = 0; ep_idx < graph_view.number_of_local_edge_partitions(); ++ep_idx) {
+        // Toplogy
+        auto edge_partition = graph_view.local_edge_partition_view(ep_idx);
+
+        RAFT_CUDA_TRY(cudaDeviceSynchronize());
+        std::cout << "rank: " << r << ", #edges = " << edge_partition.number_of_edges()
+                  << std::endl;
+
+        auto number_of_edges = edge_partition.number_of_edges();
+        auto offsets         = edge_partition.offsets();
+        auto indices         = edge_partition.indices();
+
+        RAFT_CUDA_TRY(cudaDeviceSynchronize());
+        raft::print_device_vector("offsets:", offsets.begin(), offsets.size(), std::cout);
+        RAFT_CUDA_TRY(cudaDeviceSynchronize());
+        raft::print_device_vector("indices:", indices.begin(), indices.size(), std::cout);
+
+        // Edge property values
+        if (edge_weight_view) {
+          auto value_firsts = edge_weight_view->value_firsts();
+          auto edge_counts  = edge_weight_view->edge_counts();
+
+          assert(number_of_edges == edge_counts[ep_idx]);
+
+          RAFT_CUDA_TRY(cudaDeviceSynchronize());
+          raft::print_device_vector(
+            "weights:", value_firsts[ep_idx], edge_counts[ep_idx], std::cout);
+        }
+      }
+    }
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  }
+
+  // Compute out degrees
+
+  auto d_in_degrees  = graph_view.compute_in_degrees(handle);
+  auto d_out_degrees = graph_view.compute_out_degrees(handle);
+
+  for (size_t r = 0; r < comm_size; r++) {
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    if (comm_rank == r) {
+      std::cout << "rank " << r << " : " << std::endl;
+      raft::print_device_vector(
+        "d_in_degrees:", d_in_degrees.data(), d_in_degrees.size(), std::cout);
+      raft::print_device_vector(
+        "d_out_degrees:", d_out_degrees.data(), d_out_degrees.size(), std::cout);
+    }
+  }
+
+  assert(graph_view.local_vertex_partition_range_size() == (*renumber_map).size());
+  // Run a cuGaraph algorithm
+  rmm::device_uvector<vertex_t> d_sg_cluster_v(graph_view.local_vertex_partition_range_size(),
+                                               handle.get_stream());
 
   weight_t modularity{-1.0};
   std::tie(std::ignore, modularity) = cugraph::louvain(
     handle, graph_view, edge_weight_view, d_sg_cluster_v.data(), max_level, threshold, resolution);
 
-  for (size_t i = 0; i < comm_size; i++) {
+  for (size_t r = 0; r < comm_size; r++) {
     RAFT_CUDA_TRY(cudaDeviceSynchronize());
-    if (comm_rank == i) { std::cout << comm_rank << " : " << modularity << std::endl; }
+    if (comm_rank == r) {
+      std::cout << "rank " << r << " : " << std::endl;
+      raft::print_device_vector(
+        "d_sg_cluster_v:", d_sg_cluster_v.data(), d_sg_cluster_v.size(), std::cout);
+    }
+  }
+
+  for (size_t r = 0; r < comm_size; r++) {
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    if (comm_rank == r) {
+      std::cout << "rank : " << comm_rank << ", modularity : " << modularity << std::endl;
+    }
   }
 }
 
