@@ -17,34 +17,34 @@
 
 namespace cugraph {
 
-template void matching(raft::handle_t const& handle,
-                       graph_view_t<int32_t, int32_t, false, true> const& graph_view,
-                       edge_property_view_t<int32_t, float const*> edge_weight_view,
-                       int32_t* suitors);
+template float matching(raft::handle_t const& handle,
+                        graph_view_t<int32_t, int32_t, false, true> const& graph_view,
+                        edge_property_view_t<int32_t, float const*> edge_weight_view,
+                        raft::device_span<int32_t> suitors);
 
-template void matching(raft::handle_t const& handle,
-                       graph_view_t<int32_t, int32_t, false, true> const& graph_view,
-                       edge_property_view_t<int32_t, double const*> edge_weight_view,
-                       int32_t* suitors);
+template double matching(raft::handle_t const& handle,
+                         graph_view_t<int32_t, int32_t, false, true> const& graph_view,
+                         edge_property_view_t<int32_t, double const*> edge_weight_view,
+                         raft::device_span<int32_t> suitors);
 
-template void matching(raft::handle_t const& handle,
-                       graph_view_t<int32_t, int64_t, false, true> const& graph_view,
-                       edge_property_view_t<int64_t, float const*> edge_weight_view,
-                       int32_t* suitors);
+template float matching(raft::handle_t const& handle,
+                        graph_view_t<int32_t, int64_t, false, true> const& graph_view,
+                        edge_property_view_t<int64_t, float const*> edge_weight_view,
+                        raft::device_span<int32_t> suitors);
 
-template void matching(raft::handle_t const& handle,
-                       graph_view_t<int64_t, int64_t, false, true> const& graph_view,
-                       edge_property_view_t<int64_t, float const*> edge_weight_view,
-                       int64_t* suitors);
+template float matching(raft::handle_t const& handle,
+                        graph_view_t<int64_t, int64_t, false, true> const& graph_view,
+                        edge_property_view_t<int64_t, float const*> edge_weight_view,
+                        raft::device_span<int64_t> suitors);
 
-template void matching(raft::handle_t const& handle,
-                       graph_view_t<int32_t, int64_t, false, true> const& graph_view,
-                       edge_property_view_t<int64_t, double const*> edge_weight_view,
-                       int32_t* suitors);
+template double matching(raft::handle_t const& handle,
+                         graph_view_t<int32_t, int64_t, false, true> const& graph_view,
+                         edge_property_view_t<int64_t, double const*> edge_weight_view,
+                         raft::device_span<int32_t> suitors);
 
-template void matching(raft::handle_t const& handle,
-                       graph_view_t<int64_t, int64_t, false, true> const& graph_view,
-                       edge_property_view_t<int64_t, double const*> edge_weight_view,
-                       int64_t* suitors);
+template double matching(raft::handle_t const& handle,
+                         graph_view_t<int64_t, int64_t, false, true> const& graph_view,
+                         edge_property_view_t<int64_t, double const*> edge_weight_view,
+                         raft::device_span<int64_t> suitors);
 
 }  // namespace cugraph
