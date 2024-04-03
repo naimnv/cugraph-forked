@@ -20,6 +20,7 @@
 #include "prims/transform_e.cuh"
 #include "prims/transform_reduce_e_by_src_dst_key.cuh"
 #include "prims/update_edge_src_dst_property.cuh"
+#include "utilities/collect_comm.cuh"
 
 #include <cugraph/algorithms.hpp>
 #include <cugraph/detail/shuffle_wrappers.hpp>
@@ -116,6 +117,7 @@ void matching(raft::handle_t const& handle,
 
   vertex_t itr_cnt           = 0;
   int nr_of_updated_vertices = 0;
+  vertex_t loop_counter      = 0;
   while (true) {
     if constexpr (graph_view_t::is_multi_gpu) {
       //     src_partner_cache =
@@ -366,6 +368,55 @@ void matching(raft::handle_t const& handle,
     edge_reduced_src_keys = std::move(r_src_keys);
     cp_targets            = std::move(r_cp_targets);
 
+    kv_store_t<vertex_t, vertex_t, false> target_src_map(targets.begin(),
+                                                         targets.end(),
+                                                         edge_reduced_src_keys.begin(),
+                                                         invalid_vertex_id<vertex_t>::value,
+                                                         invalid_vertex_id<vertex_t>::value,
+                                                         handle.get_stream());
+
+    rmm::device_uvector<vertex_t> match_of_srcs(0, handle.get_stream());
+
+    if (graph_view_t::is_multi_gpu) {
+      auto& comm           = handle.get_comms();
+      auto const comm_size = comm.get_size();
+      auto& major_comm     = handle.get_subcomm(cugraph::partition_manager::major_comm_name());
+      auto const major_comm_size = major_comm.get_size();
+      auto& minor_comm = handle.get_subcomm(cugraph::partition_manager::minor_comm_name());
+      auto const minor_comm_size = minor_comm.get_size();
+
+      auto partitions_range_lasts = graph_view.vertex_partition_range_lasts();
+      rmm::device_uvector<vertex_t> d_partitions_range_lasts(partitions_range_lasts.size(),
+                                                             handle.get_stream());
+
+      raft::update_device(d_partitions_range_lasts.data(),
+                          partitions_range_lasts.data(),
+                          partitions_range_lasts.size(),
+                          handle.get_stream());
+
+      cugraph::detail::compute_gpu_id_from_int_vertex_t<vertex_t> vertex_to_gpu_id_op{
+        raft::device_span<vertex_t const>(d_partitions_range_lasts.data(),
+                                          d_partitions_range_lasts.size()),
+        major_comm_size,
+        minor_comm_size};
+
+      // cugraph::detail::compute_gpu_id_from_ext_vertex_t<vertex_t> vertex_to_gpu_id_op{
+      //   comm_size, major_comm_size, minor_comm_size};
+
+      match_of_srcs = cugraph::collect_values_for_keys(handle,
+                                                       target_src_map.view(),
+                                                       edge_reduced_src_keys.begin(),
+                                                       edge_reduced_src_keys.end(),
+                                                       vertex_to_gpu_id_op);
+    } else {
+      match_of_srcs.resize(edge_reduced_src_keys.size(), handle.get_stream());
+
+      target_src_map.view().find(edge_reduced_src_keys.begin(),
+                                 edge_reduced_src_keys.end(),
+                                 match_of_srcs.begin(),
+                                 handle.get_stream());
+    }
+
     if (graph_view_t::is_multi_gpu) {
       auto const comm_rank = handle.get_comms().get_rank();
       auto const comm_size = handle.get_comms().get_size();
@@ -378,6 +429,10 @@ void matching(raft::handle_t const& handle,
                                 std::cout);
       auto targets_title = std::string("targets_").append(std::to_string(comm_rank));
       raft::print_device_vector(targets_title.c_str(), targets.begin(), targets.size(), std::cout);
+
+      auto mt_title = std::string("m_srcs_").append(std::to_string(comm_rank));
+      raft::print_device_vector(
+        mt_title.c_str(), match_of_srcs.begin(), match_of_srcs.size(), std::cout);
 
       auto optimal_offers_title = std::string("optimal_offers_").append(std::to_string(comm_rank));
       raft::print_device_vector(
@@ -394,7 +449,92 @@ void matching(raft::handle_t const& handle,
       raft::print_device_vector(
         partners_title.c_str(), partners.begin(), partners.size(), std::cout);
     }
-    break;
+
+    // match of srcs are same as targets then mask out its edges
+
+    using flag_t                                  = uint8_t;
+    rmm::device_uvector<flag_t> is_vertex_matched = rmm::device_uvector<flag_t>(
+      current_graph_view.local_vertex_partition_range_size(), handle.get_stream());
+    thrust::fill(handle.get_thrust_policy(),
+                 is_vertex_matched.begin(),
+                 is_vertex_matched.end(),
+                 flag_t{false});
+
+    cugraph::edge_src_property_t<graph_view_t, flag_t> src_match_flags(handle);
+    cugraph::edge_dst_property_t<graph_view_t, flag_t> dst_match_flags(handle);
+
+    thrust::for_each(
+      handle.get_thrust_policy(),
+      thrust::make_zip_iterator(thrust::make_tuple(match_of_srcs.begin(), targets.begin())),
+      thrust::make_zip_iterator(thrust::make_tuple(match_of_srcs.end(), targets.end())),
+      [is_vertex_matched = is_vertex_matched.data(),
+       v_first =
+         current_graph_view.local_vertex_partition_range_first()] __device__(auto msrc_tgt) {
+        auto msrc = thrust::get<0>(msrc_tgt);
+        auto tgt  = thrust::get<1>(msrc_tgt);
+        if (msrc != invalid_vertex) {
+          printf("===> %d found a match\n", static_cast<int>(tgt));
+          auto v_offset               = tgt - v_first;
+          is_vertex_matched[v_offset] = flag_t{1};
+        }
+      });
+
+    if (current_graph_view.compute_number_of_edges(handle) == 0) { break; }
+
+    if constexpr (graph_view_t::is_multi_gpu) {
+      src_match_flags =
+        cugraph::edge_src_property_t<graph_view_t, flag_t>(handle, current_graph_view);
+      dst_match_flags =
+        cugraph::edge_dst_property_t<graph_view_t, flag_t>(handle, current_graph_view);
+
+      cugraph::update_edge_src_property(
+        handle, current_graph_view, is_vertex_matched.begin(), src_match_flags);
+
+      cugraph::update_edge_dst_property(
+        handle, current_graph_view, is_vertex_matched.begin(), dst_match_flags);
+    }
+
+    if (loop_counter % 2 == 0) {
+      cugraph::transform_e(
+        handle,
+        current_graph_view,
+        graph_view_t::is_multi_gpu
+          ? src_match_flags.view()
+          : detail::edge_major_property_view_t<vertex_t, flag_t const*>(is_vertex_matched.begin()),
+        graph_view_t::is_multi_gpu ? dst_match_flags.view()
+                                   : detail::edge_minor_property_view_t<vertex_t, flag_t const*>(
+                                       is_vertex_matched.begin(), vertex_t{0}),
+        cugraph::edge_dummy_property_t{}.view(),
+        [loop_counter] __device__(
+          auto src, auto dst, auto is_src_matched, auto is_dst_matched, thrust::nullopt_t) {
+          return !((is_src_matched == uint8_t{true}) || (is_dst_matched == uint8_t{true}));
+        },
+        edge_masks_odd.mutable_view());
+
+      if (current_graph_view.has_edge_mask()) current_graph_view.clear_edge_mask();
+      cugraph::fill_edge_property(handle, current_graph_view, bool{false}, edge_masks_even);
+      current_graph_view.attach_edge_mask(edge_masks_odd.view());
+    } else {
+      cugraph::transform_e(
+        handle,
+        current_graph_view,
+        src_match_flags.view(),
+        dst_match_flags.view(),
+        cugraph::edge_dummy_property_t{}.view(),
+        [loop_counter] __device__(
+          auto src, auto dst, auto is_src_matched, auto is_dst_matched, thrust::nullopt_t) {
+          return !((is_src_matched == uint8_t{true}) || (is_dst_matched == uint8_t{true}));
+        },
+        edge_masks_even.mutable_view());
+
+      if (current_graph_view.has_edge_mask()) current_graph_view.clear_edge_mask();
+      cugraph::fill_edge_property(handle, current_graph_view, bool{false}, edge_masks_odd);
+      current_graph_view.attach_edge_mask(edge_masks_even.view());
+    }
+
+    loop_counter++;
+
+    if (loop_counter > 10) { break; }
 
     /*
     nr_of_updated_vertices =
