@@ -90,13 +90,6 @@ weight_t matching(raft::handle_t const& handle,
                         local_vertices.size(),
                         current_graph_view.local_vertex_partition_range_first());
 
-  // auto vertex_begin =
-  //   thrust::make_counting_iterator(current_graph_view.local_vertex_partition_range_first());
-  // auto vertex_end =
-  //   thrust::make_counting_iterator(current_graph_view.local_vertex_partition_range_last());
-
-  // thrust::copy(handle.get_thrust_policy(), vertex_begin, vertex_end, local_vertices.begin());
-
   vertex_t loop_counter = 0;
   while (true) {
     if constexpr (graph_view_t::is_multi_gpu) {
@@ -119,30 +112,9 @@ weight_t matching(raft::handle_t const& handle,
                       detail::edge_minor_property_view_t<vertex_t, weight_t const*>(
                         offers_from_suitors.begin(), weight_t{0}));
 
-    if (graph_view_t::is_multi_gpu) {
-      auto const comm_rank = handle.get_comms().get_rank();
-      auto const comm_size = handle.get_comms().get_size();
-
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      auto local_vertices_title = std::string("local_vertices_").append(std::to_string(comm_rank));
-
-      raft::print_device_vector(
-        local_vertices_title.c_str(), local_vertices.begin(), local_vertices.size(), std::cout);
-
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      auto offer_title = std::string("offers_").append(std::to_string(comm_rank));
-      raft::print_device_vector(offer_title.c_str(),
-                                offers_from_suitors.begin(),
-                                current_graph_view.local_vertex_partition_range_size(),
-                                std::cout);
-
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      auto partner_title = std::string("partners_").append(std::to_string(comm_rank));
-      raft::print_device_vector(partner_title.c_str(),
-                                suitors.begin(),
-                                current_graph_view.local_vertex_partition_range_size(),
-                                std::cout);
-    }
+    //
+    // For each candidate vertex, find the best possible target
+    //
 
     rmm::device_uvector<vertex_t> candidates(0, handle.get_stream());
     rmm::device_uvector<weight_t> offers_from_candidates(0, handle.get_stream());
@@ -168,13 +140,6 @@ weight_t matching(raft::handle_t const& handle,
           auto suitor_of_dst     = thrust::get<0>(dst_suitor_offer);
           auto offer_from_suitor = thrust::get<1>(dst_suitor_offer);
 
-          printf("src = %d dst = %d wt = %f suitor_of_dst = %d, offer_from_suitor = %f\n",
-                 static_cast<int>(src),
-                 static_cast<int>(dst),
-                 static_cast<float>(wt),
-                 static_cast<int>(suitor_of_dst),
-                 static_cast<float>(offer_from_suitor));
-
           auto is_better_offer =
             (offer_from_suitor < wt) || ((offer_from_suitor == wt) && (suitor_of_dst < src));
 
@@ -186,29 +151,9 @@ weight_t matching(raft::handle_t const& handle,
         reduce_op::maximum<thrust::tuple<weight_t, vertex_t, vertex_t>>{},
         true);
 
-    if (graph_view_t::is_multi_gpu) {
-      auto const comm_rank = handle.get_comms().get_rank();
-      auto const comm_size = handle.get_comms().get_size();
-
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      auto edge_reduced_src_keys_title =
-        std::string("edge_reduced_src_keys_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        edge_reduced_src_keys_title.c_str(), candidates.begin(), candidates.size(), std::cout);
-
-      auto optimal_offers_title = std::string("from_cans_").append(std::to_string(comm_rank));
-      raft::print_device_vector(optimal_offers_title.c_str(),
-                                offers_from_candidates.begin(),
-                                offers_from_candidates.size(),
-                                std::cout);
-
-      auto targets_title = std::string("targets_").append(std::to_string(comm_rank));
-      raft::print_device_vector(targets_title.c_str(), targets.begin(), targets.size(), std::cout);
-
-      auto cpt = std::string("cst_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        cpt.c_str(), curr_suitors_of_targets.begin(), curr_suitors_of_targets.size(), std::cout);
-    }
+    //
+    // For each target, find the best offer
+    //
 
     if constexpr (graph_view_t::is_multi_gpu) {
       auto vertex_partition_range_lasts = current_graph_view.vertex_partition_range_lasts();
@@ -265,30 +210,6 @@ weight_t matching(raft::handle_t const& handle,
                                       handle.get_stream());
     }
 
-    if (graph_view_t::is_multi_gpu) {
-      auto const comm_rank = handle.get_comms().get_rank();
-      auto const comm_size = handle.get_comms().get_size();
-
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      auto edge_reduced_src_keys_title =
-        std::string("edge_reduced_src_keys_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        edge_reduced_src_keys_title.c_str(), candidates.begin(), candidates.size(), std::cout);
-
-      auto optimal_offers_title = std::string("from_cans_").append(std::to_string(comm_rank));
-      raft::print_device_vector(optimal_offers_title.c_str(),
-                                offers_from_candidates.begin(),
-                                offers_from_candidates.size(),
-                                std::cout);
-
-      auto targets_title = std::string("targets_").append(std::to_string(comm_rank));
-      raft::print_device_vector(targets_title.c_str(), targets.begin(), targets.size(), std::cout);
-
-      auto cpt = std::string("cst_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        cpt.c_str(), curr_suitors_of_targets.begin(), curr_suitors_of_targets.size(), std::cout);
-    }
-
     using flag_t                        = uint8_t;
     rmm::device_uvector<flag_t> updated = rmm::device_uvector<flag_t>(
       current_graph_view.local_vertex_partition_range_size(), handle.get_stream());
@@ -338,14 +259,18 @@ weight_t matching(raft::handle_t const& handle,
     candidates              = std::move(best_candidates);
     curr_suitors_of_targets = std::move(curr_suitors_of_unique_targets);
 
-    kv_store_t<vertex_t, vertex_t, false> target_src_map(targets.begin(),
-                                                         targets.end(),
-                                                         candidates.begin(),
-                                                         invalid_vertex_id<vertex_t>::value,
-                                                         invalid_vertex_id<vertex_t>::value,
-                                                         handle.get_stream());
+    //
+    //  two vertex offer each other, that's a match
+    //
 
-    rmm::device_uvector<vertex_t> match_of_srcs(0, handle.get_stream());
+    kv_store_t<vertex_t, vertex_t, false> target_candidate_map(targets.begin(),
+                                                               targets.end(),
+                                                               candidates.begin(),
+                                                               invalid_vertex_id<vertex_t>::value,
+                                                               invalid_vertex_id<vertex_t>::value,
+                                                               handle.get_stream());
+
+    rmm::device_uvector<vertex_t> candidates_of_candidates(0, handle.get_stream());
 
     if (graph_view_t::is_multi_gpu) {
       auto& comm           = handle.get_comms();
@@ -370,52 +295,23 @@ weight_t matching(raft::handle_t const& handle,
         major_comm_size,
         minor_comm_size};
 
-      // cugraph::detail::compute_gpu_id_from_ext_vertex_t<vertex_t> vertex_to_gpu_id_op{
-      //   comm_size, major_comm_size, minor_comm_size};
-
-      match_of_srcs = cugraph::collect_values_for_keys(
-        handle, target_src_map.view(), candidates.begin(), candidates.end(), vertex_to_gpu_id_op);
+      candidates_of_candidates = cugraph::collect_values_for_keys(handle,
+                                                                  target_candidate_map.view(),
+                                                                  candidates.begin(),
+                                                                  candidates.end(),
+                                                                  vertex_to_gpu_id_op);
     } else {
-      match_of_srcs.resize(candidates.size(), handle.get_stream());
+      candidates_of_candidates.resize(candidates.size(), handle.get_stream());
 
-      target_src_map.view().find(
-        candidates.begin(), candidates.end(), match_of_srcs.begin(), handle.get_stream());
+      target_candidate_map.view().find(candidates.begin(),
+                                       candidates.end(),
+                                       candidates_of_candidates.begin(),
+                                       handle.get_stream());
     }
 
-    if (graph_view_t::is_multi_gpu) {
-      auto const comm_rank = handle.get_comms().get_rank();
-      auto const comm_size = handle.get_comms().get_size();
-
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      auto edge_reduced_src_keys_title = std::string("srcs_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        edge_reduced_src_keys_title.c_str(), candidates.begin(), candidates.size(), std::cout);
-      auto targets_title = std::string("targets_").append(std::to_string(comm_rank));
-      raft::print_device_vector(targets_title.c_str(), targets.begin(), targets.size(), std::cout);
-
-      auto mt_title = std::string("m_srcs_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        mt_title.c_str(), match_of_srcs.begin(), match_of_srcs.size(), std::cout);
-
-      auto optimal_offers_title = std::string("from_cans_").append(std::to_string(comm_rank));
-      raft::print_device_vector(optimal_offers_title.c_str(),
-                                offers_from_candidates.begin(),
-                                offers_from_candidates.size(),
-                                std::cout);
-
-      auto cpt = std::string("cst_").append(std::to_string(comm_rank));
-      raft::print_device_vector(
-        cpt.c_str(), curr_suitors_of_targets.begin(), curr_suitors_of_targets.size(), std::cout);
-    }
-
-    if (graph_view_t::is_multi_gpu) {
-      auto const comm_rank = handle.get_comms().get_rank();
-      auto const comm_size = handle.get_comms().get_size();
-      auto partners_title  = std::string("partners_").append(std::to_string(comm_rank));
-      raft::print_device_vector(partners_title.c_str(), suitors.begin(), suitors.size(), std::cout);
-    }
-
-    // match of srcs are same as targets then mask out its edges
+    //
+    // Mask out neighborhood of matched vertices
+    //
 
     using flag_t                                  = uint8_t;
     rmm::device_uvector<flag_t> is_vertex_matched = rmm::device_uvector<flag_t>(
@@ -430,30 +326,28 @@ weight_t matching(raft::handle_t const& handle,
 
     thrust::for_each(
       handle.get_thrust_policy(),
-      thrust::make_zip_iterator(thrust::make_tuple(match_of_srcs.begin(),
+      thrust::make_zip_iterator(thrust::make_tuple(candidates_of_candidates.begin(),
                                                    targets.begin(),
                                                    candidates.begin(),
                                                    offers_from_candidates.begin())),
-      thrust::make_zip_iterator(thrust::make_tuple(
-        match_of_srcs.end(), targets.end(), candidates.end(), offers_from_candidates.end())),
+      thrust::make_zip_iterator(thrust::make_tuple(candidates_of_candidates.end(),
+                                                   targets.end(),
+                                                   candidates.end(),
+                                                   offers_from_candidates.end())),
       [suitors             = suitors.begin(),
        offers_from_suitors = offers_from_suitors.begin(),
        is_vertex_matched   = is_vertex_matched.data(),
        v_first =
          current_graph_view.local_vertex_partition_range_first()] __device__(auto msrc_tgt) {
-        auto msrc        = thrust::get<0>(msrc_tgt);
-        auto tgt         = thrust::get<1>(msrc_tgt);
-        auto src         = thrust::get<2>(msrc_tgt);
-        auto offer_value = thrust::get<3>(msrc_tgt);
+        auto candidate_of_candidate = thrust::get<0>(msrc_tgt);
+        auto tgt                    = thrust::get<1>(msrc_tgt);
+        auto candiate               = thrust::get<2>(msrc_tgt);
+        auto offer_value            = thrust::get<3>(msrc_tgt);
 
-        if (msrc != invalid_vertex && msrc == tgt) {
-          printf("===> %d found  %d as match with value %f \n",
-                 static_cast<int>(tgt),
-                 static_cast<int>(src),
-                 static_cast<float>(offer_value));
+        if (candidate_of_candidate != invalid_vertex && candidate_of_candidate == tgt) {
           auto tgt_offset                 = tgt - v_first;
           is_vertex_matched[tgt_offset]   = flag_t{true};
-          suitors[tgt_offset]             = src;
+          suitors[tgt_offset]             = candiate;
           offers_from_suitors[tgt_offset] = offer_value;
         }
       });
@@ -522,7 +416,7 @@ weight_t matching(raft::handle_t const& handle,
       handle.get_comms(), sum_matched_edge_weights, raft::comms::op_t::SUM, handle.get_stream());
   }
 
-  return sum_matched_edge_weights;
+  return sum_matched_edge_weights / 2.0;
 }
 }  // namespace detail
 
