@@ -361,13 +361,13 @@ lookup_container_t<edge_t, edge_type_t, vertex_t> build_edge_id_and_type_to_src_
  * edge type @edge_type_to_lookup is not found, the corresponding entry in the device vectors of
  * the returned tuple will contain cugraph::invalid_vertex_id<vertex_t>.
  */
-template <typename vertex_t, typename edge_t, typename edge_type_t, bool multi_gpu>
-std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<vertex_t>>
-lookup_endpoints_from_edge_ids_and_single_type(
-  raft::handle_t const& handle,
-  lookup_container_t<edge_t, edge_type_t, vertex_t> const& search_container,
-  raft::device_span<edge_t const> edge_ids_to_lookup,
-  edge_type_t edge_type_to_lookup);
+// template <typename vertex_t, typename edge_t, typename edge_type_t, bool multi_gpu>
+// std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<vertex_t>>
+// lookup_endpoints_from_edge_ids_and_single_type(
+//   raft::handle_t const& handle,
+//   lookup_container_t<edge_t, edge_type_t, vertex_t> const& search_container,
+//   raft::device_span<edge_t const> edge_ids_to_lookup,
+//   edge_type_t edge_type_to_lookup);
 
 /*
  * @brief Lookup edge sources and destinations using edge ids and edge types.

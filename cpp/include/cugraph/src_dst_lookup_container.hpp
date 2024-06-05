@@ -51,21 +51,13 @@ class lookup_container_t {
 
   ~lookup_container_t();
   lookup_container_t();
-  lookup_container_t(raft::handle_t const& handle,
-                     std::vector<edge_type_t> types,
-                     std::vector<edge_id_t> type_counts);
+  lookup_container_t(raft::handle_t const& handle, size_t capacity);
   lookup_container_t(const lookup_container_t&);
 
   void insert(raft::handle_t const& handle,
-              edge_type_t typ,
               raft::device_span<edge_id_t const> edge_ids_to_insert,
+              raft::device_span<edge_type_t const> edge_types_to_insert,
               dataframe_buffer_type_t<value_t>&& values_to_insert);
-
-  dataframe_buffer_type_t<value_t> src_dst_from_edge_id_and_type(
-    raft::handle_t const& handle,
-    raft::device_span<edge_id_t const> edge_ids_to_lookup,
-    edge_type_t edge_type_to_lookup,
-    bool multi_gpu) const;
 
   dataframe_buffer_type_t<value_t> src_dst_from_edge_id_and_type(
     raft::handle_t const& handle,

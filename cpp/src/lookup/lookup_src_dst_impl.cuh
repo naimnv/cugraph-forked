@@ -31,6 +31,17 @@
 
 namespace cugraph {
 
+namespace detail {
+template <typename edge_t, typename edge_type_t>
+struct compute_key_from_edge_id_and_type_t {
+  int type_width{0};
+  __host__ __device__ int operator()(edge_t id, edge_type_t type) const
+  {
+    return (((uint64_t)id) << type_width) | (uint64_t)(type & (~(~0 << type_width)));
+  }
+};
+}  // namespace detail
+
 template <typename edge_id_t, typename edge_type_t, typename vertex_t, typename value_t>
 template <typename _edge_id_t, typename _edge_type_t, typename _vertex_t, typename _value_t>
 struct lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::lookup_container_impl {
@@ -41,70 +52,33 @@ struct lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::lookup_con
   static_assert(std::is_same_v<edge_id_t, _edge_id_t>);
   static_assert(std::is_same_v<value_t, _value_t>);
 
-  ~lookup_container_impl() {}
+  ~lookup_container_impl() { delete key_to_src_dst_kv_sotre; }
   lookup_container_impl() {}
-  lookup_container_impl(raft::handle_t const& handle,
-                        std::vector<edge_type_t> types,
-                        std::vector<edge_id_t> type_counts)
+  lookup_container_impl(raft::handle_t const& handle, size_t capacity)
   {
     auto invalid_vertex_id = cugraph::invalid_vertex_id<edge_id_t>::value;
     auto invalid_value = thrust::tuple<vertex_t, vertex_t>(invalid_vertex_id, invalid_vertex_id);
 
-    edge_type_to_kv_store = container_t{};
-    edge_type_to_kv_store.reserve(types.size());
-
-    for (size_t idx = 0; idx < types.size(); idx++) {
-      auto typ = types[idx];
-      assert(typ != empty_type_);
-      size_t store_capacity = type_counts[idx];
-
-      edge_type_to_kv_store.insert(
-        {typ, store_t(store_capacity, invalid_vertex_id, invalid_value, handle.get_stream())});
-    }
-
-    edge_type_to_kv_store.insert(
-      {empty_type_, store_t(0, invalid_vertex_id, invalid_value, handle.get_stream())});
+    key_to_src_dst_kv_sotre =
+      new container_t(capacity, invalid_vertex_id, invalid_value, handle.get_stream());
   }
 
   void insert(raft::handle_t const& handle,
-              edge_type_t type,
-              raft::device_span<edge_id_t const> edge_ids_to_insert,
+              rmm::device_uvector<uint64_t>& keys_to_insert,
               dataframe_buffer_type_t<value_t>&& values_to_insert)
   {
-    auto itr = edge_type_to_kv_store.find(type);
-
-    if (itr != edge_type_to_kv_store.end()) {
-      assert(itr->first == type);
-
-      itr->second.insert(edge_ids_to_insert.begin(),
-                         edge_ids_to_insert.end(),
-                         cugraph::get_dataframe_buffer_begin(values_to_insert),
-                         handle.get_stream());
-
-    } else {
-      assert(false);
-    }
+    key_to_src_dst_kv_sotre->insert(keys_to_insert.begin(),
+                                    keys_to_insert.end(),
+                                    cugraph::get_dataframe_buffer_begin(values_to_insert),
+                                    handle.get_stream());
   }
 
   dataframe_buffer_type_t<value_t> src_dst_from_edge_id_and_type(
     raft::handle_t const& handle,
-    raft::device_span<edge_id_t const> edge_ids_to_lookup,
-    edge_type_t edge_type_to_lookup,
+    rmm::device_uvector<uint64_t>& keys_to_lookup,
     bool multi_gpu) const
   {
-    using store_t = typename container_t::mapped_type;
-    const store_t* kv_store_object{nullptr};
-
     auto value_buffer = cugraph::allocate_dataframe_buffer<value_t>(0, handle.get_stream());
-    auto itr          = edge_type_to_kv_store.find(edge_type_to_lookup);
-
-    if (itr != edge_type_to_kv_store.end()) {
-      assert(edge_type_to_lookup == itr->first);
-      kv_store_object = &(itr->second);
-
-    } else {
-      kv_store_object = &(edge_type_to_kv_store.find(empty_type_)->second);
-    }
 
     if (multi_gpu) {
       auto& comm           = handle.get_comms();
@@ -116,177 +90,27 @@ struct lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::lookup_con
 
       value_buffer =
         cugraph::collect_values_for_keys(handle,
-                                         kv_store_object->view(),
-                                         edge_ids_to_lookup.begin(),
-                                         edge_ids_to_lookup.end(),
+                                         key_to_src_dst_kv_sotre->view(),
+                                         keys_to_lookup.begin(),
+                                         keys_to_lookup.end(),
                                          cugraph::detail::compute_gpu_id_from_ext_edge_t<edge_id_t>{
                                            comm_size, major_comm_size, minor_comm_size});
     } else {
-      cugraph::resize_dataframe_buffer(
-        value_buffer, edge_ids_to_lookup.size(), handle.get_stream());
+      cugraph::resize_dataframe_buffer(value_buffer, keys_to_lookup.size(), handle.get_stream());
 
-      kv_store_object->view().find(edge_ids_to_lookup.begin(),
-                                   edge_ids_to_lookup.end(),
-                                   cugraph::get_dataframe_buffer_begin(value_buffer),
-                                   handle.get_stream());
+      key_to_src_dst_kv_sotre->view().find(keys_to_lookup.begin(),
+                                           keys_to_lookup.end(),
+                                           cugraph::get_dataframe_buffer_begin(value_buffer),
+                                           handle.get_stream());
     }
 
     return std::make_tuple(std::move(std::get<0>(value_buffer)),
                            std::move(std::get<1>(value_buffer)));
   }
 
-  dataframe_buffer_type_t<value_t> src_dst_from_edge_id_and_type(
-    raft::handle_t const& handle,
-    raft::device_span<edge_id_t const> edge_ids_to_lookup,
-    raft::device_span<edge_type_t const> edge_types_to_lookup,
-    bool multi_gpu) const
-  {
-    static_assert(std::is_integral_v<edge_id_t>);
-    static_assert(std::is_integral_v<edge_type_t>);
-
-    assert(edge_ids_to_lookup.size() == edge_types_to_lookup.size());
-
-    rmm::device_uvector<edge_id_t> tmp_edge_ids_to_lookup(edge_ids_to_lookup.size(),
-                                                          handle.get_stream());
-
-    rmm::device_uvector<edge_type_t> tmp_edge_types_to_lookup(edge_types_to_lookup.size(),
-                                                              handle.get_stream());
-
-    rmm::device_uvector<edge_id_t> original_idxs(edge_ids_to_lookup.size(), handle.get_stream());
-
-    thrust::sequence(
-      handle.get_thrust_policy(), original_idxs.begin(), original_idxs.end(), edge_id_t{0});
-
-    thrust::copy(handle.get_thrust_policy(),
-                 edge_ids_to_lookup.begin(),
-                 edge_ids_to_lookup.end(),
-                 tmp_edge_ids_to_lookup.begin());
-
-    thrust::copy(handle.get_thrust_policy(),
-                 edge_types_to_lookup.begin(),
-                 edge_types_to_lookup.end(),
-                 tmp_edge_types_to_lookup.begin());
-
-    thrust::sort_by_key(handle.get_thrust_policy(),
-                        tmp_edge_types_to_lookup.begin(),
-                        tmp_edge_types_to_lookup.end(),
-                        thrust::make_zip_iterator(thrust::make_tuple(tmp_edge_ids_to_lookup.begin(),
-                                                                     original_idxs.begin())));
-
-    auto nr_uniqe_edge_types_to_lookup = thrust::count_if(
-      handle.get_thrust_policy(),
-      thrust::make_counting_iterator(size_t{0}),
-      thrust::make_counting_iterator(tmp_edge_types_to_lookup.size()),
-      detail::is_first_in_run_t<edge_type_t const*>{tmp_edge_types_to_lookup.data()});
-
-    rmm::device_uvector<edge_type_t> unique_types(nr_uniqe_edge_types_to_lookup,
-                                                  handle.get_stream());
-    rmm::device_uvector<edge_id_t> type_offsets(nr_uniqe_edge_types_to_lookup + 1,
-                                                handle.get_stream());
-
-    thrust::fill(
-      handle.get_thrust_policy(), type_offsets.begin(), type_offsets.end(), edge_id_t{0});
-
-    thrust::reduce_by_key(handle.get_thrust_policy(),
-                          tmp_edge_types_to_lookup.begin(),
-                          tmp_edge_types_to_lookup.end(),
-                          thrust::make_constant_iterator(size_t{1}),
-                          unique_types.begin(),
-                          type_offsets.begin());
-
-    thrust::exclusive_scan(handle.get_thrust_policy(),
-                           type_offsets.begin(),
-                           type_offsets.end(),
-                           type_offsets.begin(),
-                           size_t{0});
-
-    std::vector<edge_type_t> h_unique_types(unique_types.size());
-    std::vector<edge_id_t> h_type_offsets(type_offsets.size());
-
-    raft::update_host(
-      h_unique_types.data(), unique_types.data(), unique_types.size(), handle.get_stream());
-
-    raft::update_host(
-      h_type_offsets.data(), type_offsets.data(), type_offsets.size(), handle.get_stream());
-
-    handle.sync_stream();
-
-    std::unordered_map<edge_type_t, int> typ_to_local_idx_map{};
-    for (size_t idx = 0; idx < h_unique_types.size(); idx++) {
-      typ_to_local_idx_map[h_unique_types[idx]] = idx;
-    }
-
-    auto output_value_buffer =
-      cugraph::allocate_dataframe_buffer<value_t>(edge_ids_to_lookup.size(), handle.get_stream());
-    if (multi_gpu) {
-      auto& comm     = handle.get_comms();
-      auto rx_counts = host_scalar_allgather(comm, unique_types.size(), handle.get_stream());
-      std::vector<size_t> rx_displacements(rx_counts.size());
-      std::exclusive_scan(rx_counts.begin(), rx_counts.end(), rx_displacements.begin(), size_t{0});
-      rmm::device_uvector<edge_type_t> rx_unique_types(rx_displacements.back() + rx_counts.back(),
-                                                       handle.get_stream());
-
-      device_allgatherv(comm,
-                        unique_types.begin(),
-                        rx_unique_types.begin(),
-                        rx_counts,
-                        rx_displacements,
-                        handle.get_stream());
-      unique_types = std::move(rx_unique_types);
-
-      thrust::sort(handle.get_thrust_policy(), unique_types.begin(), unique_types.end());
-
-      unique_types.resize(
-        thrust::distance(
-          unique_types.begin(),
-          thrust::unique(handle.get_thrust_policy(), unique_types.begin(), unique_types.end())),
-        handle.get_stream());
-    }
-
-    h_unique_types.resize(unique_types.size());
-    raft::update_host(
-      h_unique_types.data(), unique_types.data(), unique_types.size(), handle.get_stream());
-
-    handle.sync_stream();
-
-    for (size_t idx = 0; idx < h_unique_types.size(); idx++) {
-      auto typ = h_unique_types[idx];
-
-      auto tmp_edge_ids_begin = tmp_edge_ids_to_lookup.begin();
-      size_t span_size        = 0;
-
-      if (typ_to_local_idx_map.find(typ) != typ_to_local_idx_map.end()) {
-        auto local_idx     = typ_to_local_idx_map[typ];
-        tmp_edge_ids_begin = tmp_edge_ids_to_lookup.begin() + h_type_offsets[local_idx];
-        span_size          = h_type_offsets[local_idx + 1] - h_type_offsets[local_idx];
-      }
-
-      auto value_buffer_typ = src_dst_from_edge_id_and_type(
-        handle, raft::device_span<edge_id_t const>{tmp_edge_ids_begin, span_size}, typ, multi_gpu);
-
-      thrust::copy(handle.get_thrust_policy(),
-                   cugraph::get_dataframe_buffer_begin(value_buffer_typ),
-                   cugraph::get_dataframe_buffer_end(value_buffer_typ),
-                   cugraph::get_dataframe_buffer_begin(output_value_buffer) +
-                     h_type_offsets[typ_to_local_idx_map[typ]]);
-    }
-
-    thrust::sort_by_key(handle.get_thrust_policy(),
-                        original_idxs.begin(),
-                        original_idxs.end(),
-                        cugraph::get_dataframe_buffer_begin(output_value_buffer));
-
-    return std::make_tuple(std::move(std::get<0>(output_value_buffer)),
-                           std::move(std::get<1>(output_value_buffer)));
-  }
-
  private:
-  using container_t =
-    std::unordered_map<edge_type_t,
-                       cugraph::kv_store_t<edge_id_t, value_t, false /*use_binary_search*/>>;
-  using store_t = typename container_t::mapped_type;
-  container_t edge_type_to_kv_store;
-  edge_type_t empty_type_ = std::numeric_limits<edge_type_t>::max() - 1;
+  using container_t = cugraph::kv_store_t<uint64_t, value_t, false /*use_binary_search*/>;
+  container_t* key_to_src_dst_kv_sotre{nullptr};
 };
 
 template <typename edge_id_t, typename edge_type_t, typename vertex_t, typename value_t>
@@ -303,9 +127,9 @@ lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::lookup_container_
 
 template <typename edge_id_t, typename edge_type_t, typename vertex_t, typename value_t>
 lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::lookup_container_t(
-  raft::handle_t const& handle, std::vector<edge_type_t> types, std::vector<edge_id_t> type_counts)
+  raft::handle_t const& handle, size_t capacity)
   : pimpl{std::make_unique<lookup_container_impl<edge_id_t, edge_type_t, vertex_t, value_t>>(
-      handle, types, type_counts)}
+      handle, capacity)}
 {
 }
 
@@ -318,23 +142,29 @@ lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::lookup_container_
 template <typename edge_id_t, typename edge_type_t, typename vertex_t, typename value_t>
 void lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::insert(
   raft::handle_t const& handle,
-  edge_type_t type,
   raft::device_span<edge_id_t const> edge_ids_to_insert,
+  raft::device_span<edge_type_t const> edge_types_to_insert,
   dataframe_buffer_type_t<value_t>&& values_to_insert)
 {
-  pimpl->insert(handle, type, edge_ids_to_insert, std::move(values_to_insert));
-}
+  int type_width = 12;
+  rmm::device_uvector<uint64_t> keys_to_insert =
+    rmm::device_uvector<uint64_t>(edge_ids_to_insert.size(), handle.get_stream());
 
-template <typename edge_id_t, typename edge_type_t, typename vertex_t, typename value_t>
-dataframe_buffer_type_t<value_t>
-lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::src_dst_from_edge_id_and_type(
-  raft::handle_t const& handle,
-  raft::device_span<edge_id_t const> edge_ids_to_lookup,
-  edge_type_t edge_type_to_lookup,
-  bool multi_gpu) const
-{
-  return pimpl->src_dst_from_edge_id_and_type(
-    handle, edge_ids_to_lookup, edge_type_to_lookup, multi_gpu);
+  thrust::transform(handle.get_thrust_policy(),
+                    thrust::make_zip_iterator(
+                      thrust::make_tuple(edge_ids_to_insert.begin(), edge_types_to_insert.begin())),
+                    thrust::make_zip_iterator(
+                      thrust::make_tuple(edge_ids_to_insert.end(), edge_types_to_insert.end())),
+                    keys_to_insert.begin(),
+                    [composite_key_func =
+                       cugraph::detail::compute_key_from_edge_id_and_type_t<edge_id_t, edge_type_t>{
+                         type_width}] __device__(auto id_and_type) {
+                      auto id   = thrust::get<0>(id_and_type);
+                      auto type = thrust::get<1>(id_and_type);
+                      return composite_key_func(id, type);
+                    });
+
+  pimpl->insert(handle, keys_to_insert, std::move(values_to_insert));
 }
 
 template <typename edge_id_t, typename edge_type_t, typename vertex_t, typename value_t>
@@ -345,8 +175,25 @@ lookup_container_t<edge_id_t, edge_type_t, vertex_t, value_t>::src_dst_from_edge
   raft::device_span<edge_type_t const> edge_types_to_lookup,
   bool multi_gpu) const
 {
-  return pimpl->src_dst_from_edge_id_and_type(
-    handle, edge_ids_to_lookup, edge_types_to_lookup, multi_gpu);
+  int type_width = 12;
+  rmm::device_uvector<uint64_t> keys_to_lookup =
+    rmm::device_uvector<uint64_t>(edge_ids_to_lookup.size(), handle.get_stream());
+
+  thrust::transform(handle.get_thrust_policy(),
+                    thrust::make_zip_iterator(
+                      thrust::make_tuple(edge_ids_to_lookup.begin(), edge_types_to_lookup.begin())),
+                    thrust::make_zip_iterator(
+                      thrust::make_tuple(edge_ids_to_lookup.end(), edge_types_to_lookup.end())),
+                    keys_to_lookup.begin(),
+                    [composite_key_func =
+                       cugraph::detail::compute_key_from_edge_id_and_type_t<edge_id_t, edge_type_t>{
+                         type_width}] __device__(auto id_and_type) {
+                      auto id   = thrust::get<0>(id_and_type);
+                      auto type = thrust::get<1>(id_and_type);
+                      return composite_key_func(id, type);
+                    });
+
+  return pimpl->src_dst_from_edge_id_and_type(handle, keys_to_lookup, multi_gpu);
 }
 
 namespace detail {
@@ -384,8 +231,8 @@ EdgeTypeAndIdToSrcDstLookupContainerType build_edge_id_and_type_to_src_dst_looku
     std::is_same_v<typename EdgeTypeAndIdToSrcDstLookupContainerType::edge_id_type, edge_id_t>,
     "edge_id_t must match with typename EdgeTypeAndIdToSrcDstLookupContainerType::edge_id_type");
 
-  rmm::device_uvector<edge_type_t> unique_types(0, handle.get_stream());
-  rmm::device_uvector<edge_t> unique_type_counts(0, handle.get_stream());
+  size_t capacity{0};
+  int type_width = 12;
 
   if constexpr (multi_gpu) {
     auto& comm                 = handle.get_comms();
@@ -395,142 +242,73 @@ EdgeTypeAndIdToSrcDstLookupContainerType build_edge_id_and_type_to_src_dst_looku
     auto& minor_comm           = handle.get_subcomm(cugraph::partition_manager::minor_comm_name());
     auto const minor_comm_size = minor_comm.get_size();
 
-    auto [gpu_ids, edge_types] =
-      cugraph::extract_transform_e(
-        handle,
-        graph_view,
-        cugraph::edge_src_dummy_property_t{}.view(),
-        cugraph::edge_dst_dummy_property_t{}.view(),
-        view_concat(edge_id_view, edge_type_view),
-        cuda::proclaim_return_type<thrust::optional<thrust::tuple<int, edge_type_t>>>(
-          [key_func =
-             cugraph::detail::compute_gpu_id_from_ext_edge_t<edge_t>{
-               comm_size,
-               major_comm_size,
-               minor_comm_size}] __device__(auto,
-                                            auto,
-                                            thrust::nullopt_t,
-                                            thrust::nullopt_t,
-                                            thrust::tuple<edge_t, edge_type_t> id_and_type) {
-            return thrust::optional<thrust::tuple<int, edge_type_t>>{thrust::make_tuple(
-              key_func(thrust::get<0>(id_and_type)), thrust::get<1>(id_and_type))};
-          }));
+    auto gpu_ids = cugraph::extract_transform_e(
+      handle,
+      graph_view,
+      cugraph::edge_src_dummy_property_t{}.view(),
+      cugraph::edge_dst_dummy_property_t{}.view(),
+      view_concat(edge_id_view, edge_type_view),
+      cuda::proclaim_return_type<thrust::optional<int>>(
+        [key_mapping_func =
+           cugraph::detail::compute_gpu_id_from_ext_edge_t<edge_t>{
+             comm_size, major_comm_size, minor_comm_size},
+         composite_key_func =
+           cugraph::detail::compute_key_from_edge_id_and_type_t<edge_t, edge_type_t>{
+             type_width}] __device__(auto,
+                                     auto,
+                                     thrust::nullopt_t,
+                                     thrust::nullopt_t,
+                                     thrust::tuple<edge_t, edge_type_t> id_and_type) {
+          edge_t id        = thrust::get<0>(id_and_type);
+          edge_type_t type = thrust::get<1>(id_and_type);
 
-    auto type_and_gpu_id_pair_begin =
-      thrust::make_zip_iterator(thrust::make_tuple(edge_types.begin(), gpu_ids.begin()));
+          return thrust::optional<int>{key_mapping_func(composite_key_func(id, type))};
+        }));
 
-    thrust::sort(handle.get_thrust_policy(),
-                 type_and_gpu_id_pair_begin,
-                 type_and_gpu_id_pair_begin + edge_types.size());
+    thrust::sort(handle.get_thrust_policy(), gpu_ids.begin(), gpu_ids.end());
 
-    auto nr_unique_paris = thrust::count_if(
-      handle.get_thrust_policy(),
-      thrust::make_counting_iterator(size_t{0}),
-      thrust::make_counting_iterator(edge_types.size()),
-      detail::is_first_in_run_t<decltype(type_and_gpu_id_pair_begin)>{type_and_gpu_id_pair_begin});
+    auto nr_unique_gpu_ids =
+      thrust::count_if(handle.get_thrust_policy(),
+                       thrust::make_counting_iterator(size_t{0}),
+                       thrust::make_counting_iterator(gpu_ids.size()),
+                       detail::is_first_in_run_t<decltype(gpu_ids.begin())>{gpu_ids.begin()});
 
-    auto unique_pairs_buffer = cugraph::allocate_dataframe_buffer<
-      typename thrust::iterator_traits<decltype(type_and_gpu_id_pair_begin)>::value_type>(
-      nr_unique_paris, handle.get_stream());
+    rmm::device_uvector<int> unique_gpu_ids(nr_unique_gpu_ids, handle.get_stream());
 
-    rmm::device_uvector<edge_t> unique_pair_counts(nr_unique_paris, handle.get_stream());
+    rmm::device_uvector<edge_t> unique_gpu_id_counts(nr_unique_gpu_ids, handle.get_stream());
 
     thrust::reduce_by_key(handle.get_thrust_policy(),
-                          type_and_gpu_id_pair_begin,
-                          type_and_gpu_id_pair_begin + edge_types.size(),
+                          gpu_ids.begin(),
+                          gpu_ids.end(),
                           thrust::make_constant_iterator(size_t{1}),
-                          cugraph::get_dataframe_buffer_begin(unique_pairs_buffer),
-                          unique_pair_counts.begin());
+                          unique_gpu_ids.begin(),
+                          unique_gpu_id_counts.begin());
 
-    edge_types.resize(0, handle.get_stream());
     gpu_ids.resize(0, handle.get_stream());
+    gpu_ids.shrink_to_fit(handle.get_stream());
 
-    std::forward_as_tuple(
-      std::tie(
-        std::get<0>(unique_pairs_buffer), std::get<1>(unique_pairs_buffer), unique_pair_counts),
-      std::ignore) =
+    std::forward_as_tuple(std::tie(unique_gpu_ids, unique_gpu_id_counts), std::ignore) =
       cugraph::groupby_gpu_id_and_shuffle_values(
         handle.get_comms(),
-        thrust::make_zip_iterator(thrust::make_tuple(std::get<0>(unique_pairs_buffer).begin(),
-                                                     std::get<1>(unique_pairs_buffer).begin(),
-                                                     unique_pair_counts.begin())),
-        thrust::make_zip_iterator(thrust::make_tuple(std::get<0>(unique_pairs_buffer).end(),
-                                                     std::get<1>(unique_pairs_buffer).end(),
-                                                     unique_pair_counts.end())),
-        [] __device__(auto val) { return thrust::get<1>(val); },
+        thrust::make_zip_iterator(
+          thrust::make_tuple(unique_gpu_ids.begin(), unique_gpu_id_counts.begin())),
+        thrust::make_zip_iterator(
+          thrust::make_tuple(unique_gpu_ids.end(), unique_gpu_id_counts.end())),
+        [] __device__(auto val) { return static_cast<int>(thrust::get<0>(val)); },
         handle.get_stream());
 
     //
     // Count local #elments for all the types mapped to this GPU
     //
 
-    thrust::sort_by_key(handle.get_thrust_policy(),
-                        std::get<0>(unique_pairs_buffer).begin(),
-                        std::get<0>(unique_pairs_buffer).end(),
-                        unique_pair_counts.begin());
-
-    auto nr_unique_types = thrust::count_if(
-      handle.get_thrust_policy(),
-      thrust::make_counting_iterator(size_t{0}),
-      thrust::make_counting_iterator(std::get<0>(unique_pairs_buffer).size()),
-      detail::is_first_in_run_t<edge_type_t const*>{std::get<0>(unique_pairs_buffer).data()});
-
-    unique_types.resize(static_cast<size_t>(nr_unique_types), handle.get_stream());
-    unique_type_counts.resize(static_cast<size_t>(nr_unique_types), handle.get_stream());
-
-    thrust::reduce_by_key(handle.get_thrust_policy(),
-                          std::get<0>(unique_pairs_buffer).begin(),
-                          std::get<0>(unique_pairs_buffer).end(),
-                          unique_pair_counts.begin(),
-                          unique_types.begin(),
-                          unique_type_counts.begin());
+    capacity = static_cast<size_t>(thrust::reduce(
+      handle.get_thrust_policy(), unique_gpu_id_counts.begin(), unique_gpu_id_counts.end()));
 
   } else {
-    auto edge_types = cugraph::extract_transform_e(
-      handle,
-      graph_view,
-      cugraph::edge_src_dummy_property_t{}.view(),
-      cugraph::edge_dst_dummy_property_t{}.view(),
-      edge_type_view,
-      cuda::proclaim_return_type<thrust::optional<edge_type_t>>(
-        [] __device__(auto, auto, thrust::nullopt_t, thrust::nullopt_t, edge_type_t et) {
-          return thrust::optional<edge_type_t>{et};
-        }));
-
-    thrust::sort(handle.get_thrust_policy(), edge_types.begin(), edge_types.end());
-
-    auto nr_unique_types =
-      thrust::count_if(handle.get_thrust_policy(),
-                       thrust::make_counting_iterator(size_t{0}),
-                       thrust::make_counting_iterator(edge_types.size()),
-                       detail::is_first_in_run_t<edge_type_t const*>{edge_types.data()});
-
-    unique_types.resize(static_cast<size_t>(nr_unique_types), handle.get_stream());
-    unique_type_counts.resize(static_cast<size_t>(nr_unique_types), handle.get_stream());
-
-    thrust::reduce_by_key(handle.get_thrust_policy(),
-                          edge_types.begin(),
-                          edge_types.end(),
-                          thrust::make_constant_iterator(size_t{1}),
-                          unique_types.begin(),
-                          unique_type_counts.begin());
+    capacity = static_cast<size_t>(graph_view.compute_number_of_edges(handle));
   }
 
-  std::vector<edge_type_t> h_unique_types(unique_types.size());
-  std::vector<edge_t> h_unique_type_counts(unique_types.size());
-
-  raft::update_host(
-    h_unique_types.data(), unique_types.data(), unique_types.size(), handle.get_stream());
-
-  raft::update_host(h_unique_type_counts.data(),
-                    unique_type_counts.data(),
-                    unique_type_counts.size(),
-                    handle.get_stream());
-
-  handle.sync_stream();
-
-  auto search_container =
-    EdgeTypeAndIdToSrcDstLookupContainerType(handle, h_unique_types, h_unique_type_counts);
+  auto search_container = EdgeTypeAndIdToSrcDstLookupContainerType(handle, capacity);
 
   //
   // Populate the search container
@@ -582,7 +360,7 @@ EdgeTypeAndIdToSrcDstLookupContainerType build_edge_id_and_type_to_src_dst_looku
       graph_view.local_edge_partition_segment_offsets(local_ep_idx));
 
     //
-    // Shuffle to the right GPUs using edge ids as keys
+    // Shuffle to the right GPUs using function(edge id, edge_type) as keys
     //
 
     if constexpr (multi_gpu) {
@@ -605,91 +383,45 @@ EdgeTypeAndIdToSrcDstLookupContainerType build_edge_id_and_type_to_src_dst_looku
                                                        edgelist_minors.end(),
                                                        edgelist_ids.end(),
                                                        edgelist_types.end())),
-          [key_func =
+          [key_mapping_func =
              cugraph::detail::compute_gpu_id_from_ext_edge_t<edge_t>{
-               comm_size,
-               major_comm_size,
-               minor_comm_size}] __device__(auto val) { return key_func(thrust::get<2>(val)); },
+               comm_size, major_comm_size, minor_comm_size},
+           composite_key_func =
+             cugraph::detail::compute_key_from_edge_id_and_type_t<edge_t, edge_type_t>{
+               type_width}] __device__(auto val) {
+            return key_mapping_func(composite_key_func(thrust::get<2>(val), thrust::get<3>(val)));
+          },
           handle.get_stream());
     }
 
-    //
-    // Sort by edge types and insert to type specific kv_store_t object
-    //
+    auto nr_elements_to_insert = edgelist_minors.size();
+    auto values_to_insert =
+      cugraph::allocate_dataframe_buffer<value_t>(nr_elements_to_insert, handle.get_stream());
 
-    auto itr_to_triple = thrust::make_zip_iterator(
-      edgelist_majors.begin(), edgelist_minors.begin(), edgelist_ids.begin());
+    auto zip_itr = thrust::make_zip_iterator(
+      thrust::make_tuple(edgelist_majors.begin(), edgelist_minors.begin()));
 
-    thrust::sort_by_key(
-      handle.get_thrust_policy(), edgelist_types.begin(), edgelist_types.end(), itr_to_triple);
+    thrust::copy(handle.get_thrust_policy(),
+                 zip_itr,
+                 zip_itr + nr_elements_to_insert,
+                 cugraph::get_dataframe_buffer_begin(values_to_insert));
 
-    auto nr_uniqe_edge_types_partition =
-      thrust::count_if(handle.get_thrust_policy(),
-                       thrust::make_counting_iterator(size_t{0}),
-                       thrust::make_counting_iterator(edgelist_types.size()),
-                       detail::is_first_in_run_t<edge_type_t const*>{edgelist_types.data()});
+    static_assert(
+      std::is_same_v<typename thrust::iterator_traits<decltype(cugraph::get_dataframe_buffer_begin(
+                       values_to_insert))>::value_type,
+                     value_t>);
 
-    rmm::device_uvector<edge_type_t> unique_types(nr_uniqe_edge_types_partition,
-                                                  handle.get_stream());
-    rmm::device_uvector<edge_t> type_offsets(nr_uniqe_edge_types_partition + 1,
-                                             handle.get_stream());
-
-    thrust::fill(handle.get_thrust_policy(), type_offsets.begin(), type_offsets.end(), edge_t{0});
-
-    thrust::reduce_by_key(handle.get_thrust_policy(),
-                          edgelist_types.begin(),
-                          edgelist_types.end(),
-                          thrust::make_constant_iterator(size_t{1}),
-                          unique_types.begin(),
-                          type_offsets.begin());
-
-    thrust::exclusive_scan(handle.get_thrust_policy(),
-                           type_offsets.begin(),
-                           type_offsets.end(),
-                           type_offsets.begin(),
-                           size_t{0});
-
-    std::vector<edge_type_t> h_unique_types(unique_types.size());
-    std::vector<edge_t> h_type_offsets(type_offsets.size());
-
-    raft::update_host(
-      h_unique_types.data(), unique_types.data(), unique_types.size(), handle.get_stream());
-
-    raft::update_host(
-      h_type_offsets.data(), type_offsets.data(), type_offsets.size(), handle.get_stream());
-    handle.sync_stream();
-
-    for (size_t idx = 0; idx < h_unique_types.size(); idx++) {
-      auto typ                   = h_unique_types[idx];
-      auto nr_elements_to_insert = (h_type_offsets[idx + 1] - h_type_offsets[idx]);
-
-      auto values_to_insert =
-        cugraph::allocate_dataframe_buffer<value_t>(nr_elements_to_insert, handle.get_stream());
-
-      auto zip_itr = thrust::make_zip_iterator(
-        thrust::make_tuple(edgelist_majors.begin(), edgelist_minors.begin()));
-
-      thrust::copy(handle.get_thrust_policy(),
-                   zip_itr + h_type_offsets[idx],
-                   zip_itr + h_type_offsets[idx] + nr_elements_to_insert,
-                   cugraph::get_dataframe_buffer_begin(values_to_insert));
-
-      static_assert(std::is_same_v<
-                    typename thrust::iterator_traits<decltype(cugraph::get_dataframe_buffer_begin(
-                      values_to_insert))>::value_type,
-                    value_t>);
-
-      search_container.insert(handle,
-                              typ,
-                              raft::device_span<edge_t>(edgelist_ids.begin() + h_type_offsets[idx],
-                                                        nr_elements_to_insert),
-                              std::move(values_to_insert));
-    }
+    search_container.insert(
+      handle,
+      raft::device_span<edge_t>(edgelist_ids.begin(), edgelist_ids.size()),
+      raft::device_span<edge_type_t>(edgelist_types.begin(), edgelist_types.size()),
+      std::move(values_to_insert));
   }
 
   return search_container;
 }
 
+/*
 template <typename vertex_t,
           typename edge_id_t,
           typename edge_type_t,
@@ -720,6 +452,7 @@ lookup_endpoints_from_edge_ids_and_single_type(
   return std::make_tuple(std::move(std::get<0>(value_buffer)),
                          std::move(std::get<1>(value_buffer)));
 }
+*/
 
 template <typename vertex_t,
           typename edge_id_t,
@@ -755,6 +488,7 @@ lookup_endpoints_from_edge_ids_and_types(
 }
 }  // namespace detail
 
+/*
 template <typename vertex_t, typename edge_id_t, typename edge_type_t, bool multi_gpu>
 std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<vertex_t>>
 lookup_endpoints_from_edge_ids_and_single_type(
@@ -771,6 +505,7 @@ lookup_endpoints_from_edge_ids_and_single_type(
                                                                 multi_gpu>(
     handle, search_container, edge_ids_to_lookup, edge_type_to_lookup);
 }
+*/
 
 template <typename vertex_t, typename edge_id_t, typename edge_type_t, bool multi_gpu>
 std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<vertex_t>>

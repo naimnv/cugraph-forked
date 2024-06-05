@@ -28,12 +28,12 @@ template lookup_container_t<int32_t, int32_t, int32_t> build_edge_id_and_type_to
   edge_property_view_t<int32_t, int32_t const*> edge_id_view,
   edge_property_view_t<int32_t, int32_t const*> edge_type_view);
 
-template std::tuple<rmm::device_uvector<int32_t>, rmm::device_uvector<int32_t>>
-lookup_endpoints_from_edge_ids_and_single_type<int32_t, int32_t, int32_t, true>(
-  raft::handle_t const& handle,
-  lookup_container_t<int32_t, int32_t, int32_t> const& search_container,
-  raft::device_span<int32_t const> edge_ids_to_lookup,
-  int32_t edge_type_to_lookup);
+// template std::tuple<rmm::device_uvector<int32_t>, rmm::device_uvector<int32_t>>
+// lookup_endpoints_from_edge_ids_and_single_type<int32_t, int32_t, int32_t, true>(
+//   raft::handle_t const& handle,
+//   lookup_container_t<int32_t, int32_t, int32_t> const& search_container,
+//   raft::device_span<int32_t const> edge_ids_to_lookup,
+//   int32_t edge_type_to_lookup);
 
 template std::tuple<rmm::device_uvector<int32_t>, rmm::device_uvector<int32_t>>
 lookup_endpoints_from_edge_ids_and_types<int32_t, int32_t, int32_t, true>(
@@ -48,12 +48,12 @@ template lookup_container_t<int64_t, int32_t, int32_t> build_edge_id_and_type_to
   edge_property_view_t<int64_t, int64_t const*> edge_id_view,
   edge_property_view_t<int64_t, int32_t const*> edge_type_view);
 
-template std::tuple<rmm::device_uvector<int32_t>, rmm::device_uvector<int32_t>>
-lookup_endpoints_from_edge_ids_and_single_type<int32_t, int64_t, int32_t, true>(
-  raft::handle_t const& handle,
-  lookup_container_t<int64_t, int32_t, int32_t> const& search_container,
-  raft::device_span<int64_t const> edge_ids_to_lookup,
-  int32_t edge_type_to_lookup);
+// template std::tuple<rmm::device_uvector<int32_t>, rmm::device_uvector<int32_t>>
+// lookup_endpoints_from_edge_ids_and_single_type<int32_t, int64_t, int32_t, true>(
+//   raft::handle_t const& handle,
+//   lookup_container_t<int64_t, int32_t, int32_t> const& search_container,
+//   raft::device_span<int64_t const> edge_ids_to_lookup,
+//   int32_t edge_type_to_lookup);
 
 template std::tuple<rmm::device_uvector<int32_t>, rmm::device_uvector<int32_t>>
 lookup_endpoints_from_edge_ids_and_types<int32_t, int64_t, int32_t, true>(
@@ -68,12 +68,12 @@ template lookup_container_t<int64_t, int32_t, int64_t> build_edge_id_and_type_to
   edge_property_view_t<int64_t, int64_t const*> edge_id_view,
   edge_property_view_t<int64_t, int32_t const*> edge_type_view);
 
-template std::tuple<rmm::device_uvector<int64_t>, rmm::device_uvector<int64_t>>
-lookup_endpoints_from_edge_ids_and_single_type<int64_t, int64_t, int32_t, true>(
-  raft::handle_t const& handle,
-  lookup_container_t<int64_t, int32_t, int64_t> const& search_container,
-  raft::device_span<int64_t const> edge_ids_to_lookup,
-  int32_t edge_type_to_lookup);
+// template std::tuple<rmm::device_uvector<int64_t>, rmm::device_uvector<int64_t>>
+// lookup_endpoints_from_edge_ids_and_single_type<int64_t, int64_t, int32_t, true>(
+//   raft::handle_t const& handle,
+//   lookup_container_t<int64_t, int32_t, int64_t> const& search_container,
+//   raft::device_span<int64_t const> edge_ids_to_lookup,
+//   int32_t edge_type_to_lookup);
 
 template std::tuple<rmm::device_uvector<int64_t>, rmm::device_uvector<int64_t>>
 lookup_endpoints_from_edge_ids_and_types<int64_t, int64_t, int32_t, true>(
